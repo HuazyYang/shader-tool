@@ -411,3 +411,212 @@ function(shadertool_add_shader_objects)
         endif()
     endif()
 endfunction()
+
+# shadertool_add_shader_containers() — compiles each Slang module in SOURCES
+# into one NVRHI shader container, <OUTPUT_DIR>/<dir>/<stem>.nvsc, holding the
+# code and the reflection of every requested target (module-level: every
+# [shader(...)] entry point the target can hold), and gathers them under one
+# custom target. The container format is include/nvrhi-shader-container.h.
+#
+#   shadertool_add_shader_containers(
+#       TARGET <name>                         # custom target to create
+#       SOURCES <file.slang>...               # relative to the current source dir
+#       [TARGETS <target>...]                 # dxbc dxil spirv ptx optix
+#                                             # (default: dxil spirv)
+#       [OUTPUT_DIR <dir>]                    # default: <current binary dir>/shaders
+#       [BASE_DIRECTORY <dir>]                # <dir> above = source dir relative to
+#                                             # this (default: current source dir)
+#       [INCLUDE_DIRS <dir>...]
+#       [DEFINES <NAME[=VALUE]>...]
+#       [OPTIX_INCLUDE_DIR <dir>]             # optix target; default:
+#                                             # $ENV{OptiX_INSTALL_DIR}/include
+#       [SHADER_MODEL <major_minor>]          # DXIL shader model (default: 6_5)
+#       [OPTIMIZATION_LEVEL <0-3>]
+#       [WARNINGS_AS_ERRORS] [DEBUG_INFO]
+#       [MATRIX_LAYOUT ROW_MAJOR|COLUMN_MAJOR]
+#       [SPIRV_TARGET_ENV <env>]              # default: vulkan1.2
+#       [SPIRV_REGISTER_SHIFTS <t> <s> <b> <u>] # default: 0 128 256 384, NVRHI's
+#       [NO_SPIRV_REGISTER_SHIFTS]            # Vulkan binding offsets
+#       [EXTRA_FLAGS <flag>...]               # extra ShaderTool flags
+#       [FOLDER <ide folder>]
+#       [OUTPUT_VARIABLE <variable>])         # receives the .nvsc paths
+#
+# The ptx and optix targets need NVRTC (nvrtc64_*.dll / libnvrtc.so) where the
+# build runs; Slang loads it at compile time. Like shadertool_add_shader_objects()
+# the outputs are config-agnostic, and DEPFILE needs CMake >= 3.21 with the
+# Visual Studio generators.
+function(shadertool_add_shader_containers)
+    set(options WARNINGS_AS_ERRORS DEBUG_INFO NO_SPIRV_REGISTER_SHIFTS)
+    set(oneValueArgs
+        TARGET OUTPUT_DIR BASE_DIRECTORY OPTIX_INCLUDE_DIR SHADER_MODEL
+        OPTIMIZATION_LEVEL MATRIX_LAYOUT SPIRV_TARGET_ENV FOLDER OUTPUT_VARIABLE)
+    set(multiValueArgs
+        SOURCES TARGETS INCLUDE_DIRS DEFINES SPIRV_REGISTER_SHIFTS EXTRA_FLAGS)
+    cmake_parse_arguments(arg "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    # ---- argument validation ----------------------------------------------
+    if(arg_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR
+            "unknown shadertool_add_shader_containers arguments: ${arg_UNPARSED_ARGUMENTS}")
+    endif()
+    if(NOT arg_TARGET OR NOT arg_SOURCES)
+        message(FATAL_ERROR
+            "shadertool_add_shader_containers requires TARGET and non-empty SOURCES")
+    endif()
+    if(TARGET "${arg_TARGET}")
+        message(FATAL_ERROR "shader container target already exists: ${arg_TARGET}")
+    endif()
+
+    if(NOT arg_TARGETS)
+        set(arg_TARGETS dxil spirv)
+    endif()
+    set(container_targets)
+    foreach(container_target IN LISTS arg_TARGETS)
+        string(TOLOWER "${container_target}" container_target)
+        if(NOT container_target MATCHES "^(dxbc|dxil|spirv|ptx|optix)$")
+            message(FATAL_ERROR "unknown container target: ${container_target} "
+                "(expected dxbc, dxil, spirv, ptx or optix)")
+        endif()
+        if(container_target IN_LIST container_targets)
+            message(FATAL_ERROR "duplicate container target: ${container_target}")
+        endif()
+        list(APPEND container_targets "${container_target}")
+    endforeach()
+    string(JOIN "," container_target_list ${container_targets})
+
+    if(NOT arg_OUTPUT_DIR)
+        set(arg_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+    endif()
+    cmake_path(ABSOLUTE_PATH arg_OUTPUT_DIR NORMALIZE)
+    if(NOT arg_BASE_DIRECTORY)
+        set(arg_BASE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endif()
+    cmake_path(ABSOLUTE_PATH arg_BASE_DIRECTORY NORMALIZE)
+
+    if(NOT arg_SHADER_MODEL)
+        set(arg_SHADER_MODEL 6_5)
+    endif()
+    if(NOT arg_SHADER_MODEL MATCHES "^[0-9]+_[0-9]+$")
+        message(FATAL_ERROR "invalid SHADER_MODEL: ${arg_SHADER_MODEL}")
+    endif()
+    if(DEFINED arg_OPTIMIZATION_LEVEL AND NOT arg_OPTIMIZATION_LEVEL MATCHES "^[0-3]$")
+        message(FATAL_ERROR
+            "OPTIMIZATION_LEVEL must be 0..3, got ${arg_OPTIMIZATION_LEVEL}")
+    endif()
+    if(arg_MATRIX_LAYOUT AND
+       NOT arg_MATRIX_LAYOUT MATCHES "^(ROW_MAJOR|COLUMN_MAJOR)$")
+        message(FATAL_ERROR
+            "MATRIX_LAYOUT must be ROW_MAJOR or COLUMN_MAJOR, got ${arg_MATRIX_LAYOUT}")
+    endif()
+    if(NOT DEFINED arg_SPIRV_REGISTER_SHIFTS)
+        set(arg_SPIRV_REGISTER_SHIFTS 0 128 256 384)
+    endif()
+    list(LENGTH arg_SPIRV_REGISTER_SHIFTS spirv_shift_count)
+    if(NOT arg_NO_SPIRV_REGISTER_SHIFTS AND NOT spirv_shift_count EQUAL 4)
+        message(FATAL_ERROR
+            "SPIRV_REGISTER_SHIFTS requires exactly 4 values <t> <s> <b> <u>, "
+            "got: ${arg_SPIRV_REGISTER_SHIFTS}")
+    endif()
+    if(NOT arg_SPIRV_TARGET_ENV)
+        set(arg_SPIRV_TARGET_ENV vulkan1.2)
+    endif()
+
+    # ---- ShaderTool flags ---------------------------------------------------
+    set(flags --container-targets "${container_target_list}"
+        --shader-model "${arg_SHADER_MODEL}")
+    foreach(include_dir IN LISTS arg_INCLUDE_DIRS)
+        cmake_path(ABSOLUTE_PATH include_dir NORMALIZE)
+        list(APPEND flags -I "${include_dir}")
+    endforeach()
+    foreach(define IN LISTS arg_DEFINES)
+        list(APPEND flags -D "${define}")
+    endforeach()
+    if(DEFINED arg_OPTIMIZATION_LEVEL)
+        list(APPEND flags "-O${arg_OPTIMIZATION_LEVEL}")
+    endif()
+    if(arg_WARNINGS_AS_ERRORS)
+        list(APPEND flags -WX)
+    endif()
+    if(arg_DEBUG_INFO)
+        list(APPEND flags -Zi)
+    endif()
+    if(arg_MATRIX_LAYOUT STREQUAL "ROW_MAJOR")
+        list(APPEND flags -Zpr)
+    elseif(arg_MATRIX_LAYOUT STREQUAL "COLUMN_MAJOR")
+        list(APPEND flags -Zpc)
+    endif()
+    if("spirv" IN_LIST container_targets)
+        if(NOT arg_NO_SPIRV_REGISTER_SHIFTS)
+            list(GET arg_SPIRV_REGISTER_SHIFTS 0 shift_t)
+            list(GET arg_SPIRV_REGISTER_SHIFTS 1 shift_s)
+            list(GET arg_SPIRV_REGISTER_SHIFTS 2 shift_b)
+            list(GET arg_SPIRV_REGISTER_SHIFTS 3 shift_u)
+            foreach(space RANGE 7)
+                list(APPEND flags
+                    -fvk-t-shift "${shift_t}" "${space}"
+                    -fvk-s-shift "${shift_s}" "${space}"
+                    -fvk-b-shift "${shift_b}" "${space}"
+                    -fvk-u-shift "${shift_u}" "${space}")
+            endforeach()
+        endif()
+        list(APPEND flags "-fspv-target-env=${arg_SPIRV_TARGET_ENV}")
+    endif()
+    if("optix" IN_LIST container_targets)
+        if(NOT arg_OPTIX_INCLUDE_DIR AND DEFINED ENV{OptiX_INSTALL_DIR})
+            set(arg_OPTIX_INCLUDE_DIR "$ENV{OptiX_INSTALL_DIR}/include")
+        endif()
+        if(arg_OPTIX_INCLUDE_DIR)
+            cmake_path(ABSOLUTE_PATH arg_OPTIX_INCLUDE_DIR NORMALIZE)
+            list(APPEND flags --optix-include "${arg_OPTIX_INCLUDE_DIR}")
+        endif()
+    endif()
+    list(APPEND flags ${arg_EXTRA_FLAGS})
+
+    # ---- one container per module --------------------------------------------
+    set(intermediate_root "${CMAKE_CURRENT_BINARY_DIR}/__shadertool_${arg_TARGET}")
+    set(all_outputs)
+    set(all_sources)
+    foreach(source IN LISTS arg_SOURCES)
+        cmake_path(ABSOLUTE_PATH source NORMALIZE OUTPUT_VARIABLE source_abs)
+        cmake_path(GET source_abs PARENT_PATH source_dir)
+        cmake_path(GET source_abs STEM LAST_ONLY source_stem)
+        cmake_path(RELATIVE_PATH source_dir BASE_DIRECTORY "${arg_BASE_DIRECTORY}"
+            OUTPUT_VARIABLE relative_dir)
+        if(relative_dir STREQUAL "." OR relative_dir MATCHES "^\\.\\.($|/)")
+            set(relative_dir "")
+        endif()
+        set(relative_prefix "")
+        if(relative_dir)
+            set(relative_prefix "${relative_dir}/")
+        endif()
+
+        set(output_dir "${arg_OUTPUT_DIR}/${relative_prefix}")
+        set(output_path "${output_dir}${source_stem}.nvsc")
+        if(output_path IN_LIST all_outputs)
+            message(FATAL_ERROR "shadertool_add_shader_containers: two sources map to "
+                "${output_path}; set BASE_DIRECTORY or rename one")
+        endif()
+        set(depfile_dir "${intermediate_root}/${relative_prefix}")
+        set(depfile_path "${depfile_dir}${source_stem}.d")
+
+        add_custom_command(
+            OUTPUT "${output_path}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${output_dir}" "${depfile_dir}"
+            COMMAND "$<TARGET_FILE:ShaderTool::ShaderTool>" container
+                ${flags} -Fo "${output_path}" -depfile "${depfile_path}" "${source_abs}"
+            DEPENDS ShaderTool::ShaderTool "${source_abs}"
+            DEPFILE "${depfile_path}"
+            COMMENT "ShaderTool [container: ${container_target_list}] ${source}"
+            VERBATIM)
+        list(APPEND all_outputs "${output_path}")
+        list(APPEND all_sources "${source_abs}")
+    endforeach()
+
+    add_custom_target("${arg_TARGET}" DEPENDS ${all_outputs} SOURCES ${all_sources})
+    if(arg_FOLDER)
+        set_target_properties("${arg_TARGET}" PROPERTIES FOLDER "${arg_FOLDER}")
+    endif()
+    if(arg_OUTPUT_VARIABLE)
+        set(${arg_OUTPUT_VARIABLE} "${all_outputs}" PARENT_SCOPE)
+    endif()
+endfunction()

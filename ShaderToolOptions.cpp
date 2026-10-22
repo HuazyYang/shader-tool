@@ -15,13 +15,17 @@ enum BackendMask : uint32_t {
     MaskSlangDxbc = 1u << 3,
     MaskSlangDxil = 1u << 4,
     MaskSlangSpirv = 1u << 5,
+    MaskContainer = 1u << 6,   // Slang module -> NVRHI shader container
 
     MaskDxbcClass = MaskDxbc | MaskSlangDxbc,               // SM 5_0/5_1 targets
     MaskDxcClass = MaskDxil | MaskSpirv,                    // native DXC backends
     MaskSpirvClass = MaskSpirv | MaskSlangSpirv,            // SPIR-V emitting backends
     MaskSlangClass = MaskSlangDxbc | MaskSlangDxil | MaskSlangSpirv,
     MaskSm6Class = MaskDxil | MaskSpirv | MaskSlangDxil | MaskSlangSpirv,
-    MaskAll = MaskDxbc | MaskDxil | MaskSpirv | MaskSlangClass
+    MaskCompile = MaskDxbc | MaskDxil | MaskSpirv | MaskSlangClass, // one entry point
+    MaskSpirvContainer = MaskSpirvClass | MaskContainer,    // the container's SPIR-V too
+    MaskSlangContainer = MaskSlangClass | MaskContainer,
+    MaskAll = MaskCompile | MaskContainer
 };
 
 enum class OptionKind {
@@ -37,6 +41,9 @@ enum class OptionKind {
     OutputHeader,
     HeaderVariable,
     OptimizationLevel,
+    ContainerTargets,  // --container-targets LIST
+    OptixInclude,      // --optix-include DIR
+    ShaderModel,       // --shader-model MAJOR_MINOR
     ForwardFlag,       // emit the option name alone
     ForwardSeparate,   // emit the option name, then each value as its own token
     ForwardJoined      // emit "name=value" as a single token
@@ -83,10 +90,18 @@ const OptionSpec OptionSpecs[] = {
      "define a macro for every variant without keying the permutation"},
     {OptionKind::Include, MaskAll, "-I", 1, "DIRECTORY", "add an include directory"},
 
-    GROUP(MaskAll, "Entry point and shader profile"),
-    {OptionKind::Entry, MaskAll, "-E", 1, "ENTRY", "entry point name (default: main)"},
-    {OptionKind::Profile, MaskAll, "-T", 1, "PROFILE",
+    GROUP(MaskCompile, "Entry point and shader profile"),
+    {OptionKind::Entry, MaskCompile, "-E", 1, "ENTRY", "entry point name (default: main)"},
+    {OptionKind::Profile, MaskCompile, "-T", 1, "PROFILE",
      "full shader profile with model, e.g. ps_6_5 or vs_5_0 (required)"},
+
+    GROUP(MaskContainer, "Shader container"),
+    {OptionKind::ContainerTargets, MaskContainer, "--container-targets", 1, "LIST",
+     "code targets, comma-separated: dxbc,dxil,spirv,ptx,optix (required)"},
+    {OptionKind::OptixInclude, MaskContainer, "--optix-include", 1, "DIRECTORY",
+     "OptiX SDK include directory for NVRTC (default: $OptiX_INSTALL_DIR/include)"},
+    {OptionKind::ShaderModel, MaskContainer, "--shader-model", 1, "MAJOR_MINOR",
+     "DXIL shader model, also used for the D3D registers of ptx/optix (default: 6_5)"},
 
     GROUP(MaskAll, "Optimization"),
     {OptionKind::OptimizationLevel, MaskAll, "-O0", 0, nullptr, "optimization level 0"},
@@ -113,7 +128,7 @@ const OptionSpec OptionSpecs[] = {
      "HLSL language version (e.g. 2021)"},
     {OptionKind::ForwardFlag, MaskDxbc | MaskDxcClass, "-all-resources-bound", 0,
      nullptr, "assume all resources are bound"},
-    {OptionKind::ForwardFlag, MaskSm6Class, "-enable-16bit-types", 0, nullptr,
+    {OptionKind::ForwardFlag, MaskSm6Class | MaskContainer, "-enable-16bit-types", 0, nullptr,
      "enable native 16-bit types (SM 6.2+)"},
 
     GROUP(MaskAll, "Debug information"),
@@ -122,29 +137,29 @@ const OptionSpec OptionSpecs[] = {
     // (CompilerLibrary.cpp); EMBED_PDB passes it to every backend (Aftermath builds D3D11 shaders too).
     {OptionKind::ForwardFlag, MaskAll, "-Qembed_debug", 0, nullptr,
      "embed debug information in the shader"},
-    {OptionKind::ForwardFlag, MaskSlangClass, "-g", 0, nullptr,
+    {OptionKind::ForwardFlag, MaskSlangContainer, "-g", 0, nullptr,
      "emit debug information (slang)"},
 
-    GROUP(MaskSpirvClass, "SPIR-V binding remapping"),
-    {OptionKind::ForwardSeparate, MaskSpirvClass, "-fvk-b-shift", 2, "SHIFT SPACE",
+    GROUP(MaskSpirvContainer, "SPIR-V binding remapping"),
+    {OptionKind::ForwardSeparate, MaskSpirvContainer, "-fvk-b-shift", 2, "SHIFT SPACE",
      "shift constant-buffer bindings"},
-    {OptionKind::ForwardSeparate, MaskSpirvClass, "-fvk-s-shift", 2, "SHIFT SPACE",
+    {OptionKind::ForwardSeparate, MaskSpirvContainer, "-fvk-s-shift", 2, "SHIFT SPACE",
      "shift sampler bindings"},
-    {OptionKind::ForwardSeparate, MaskSpirvClass, "-fvk-t-shift", 2, "SHIFT SPACE",
+    {OptionKind::ForwardSeparate, MaskSpirvContainer, "-fvk-t-shift", 2, "SHIFT SPACE",
      "shift texture bindings"},
-    {OptionKind::ForwardSeparate, MaskSpirvClass, "-fvk-u-shift", 2, "SHIFT SPACE",
+    {OptionKind::ForwardSeparate, MaskSpirvContainer, "-fvk-u-shift", 2, "SHIFT SPACE",
      "shift UAV bindings"},
     {OptionKind::ForwardSeparate, MaskSpirvClass, "-fvk-bind-register", 4,
      "TYPE# SPACE BINDING SET", "remap a single register"},
     {OptionKind::ForwardFlag, MaskSpirvClass, "-fvk-auto-shift-bindings", 0, nullptr,
      "automatically shift Vulkan bindings"},
 
-    GROUP(MaskSpirvClass, "SPIR-V memory layout and semantics"),
-    {OptionKind::ForwardFlag, MaskSpirvClass, "-fvk-use-dx-layout", 0, nullptr,
+    GROUP(MaskSpirvContainer, "SPIR-V memory layout and semantics"),
+    {OptionKind::ForwardFlag, MaskSpirvContainer, "-fvk-use-dx-layout", 0, nullptr,
      "use DirectX memory layout"},
-    {OptionKind::ForwardFlag, MaskSpirvClass, "-fvk-use-gl-layout", 0, nullptr,
+    {OptionKind::ForwardFlag, MaskSpirvContainer, "-fvk-use-gl-layout", 0, nullptr,
      "use OpenGL std140/std430 memory layout"},
-    {OptionKind::ForwardFlag, MaskSpirvClass, "-fvk-use-scalar-layout", 0, nullptr,
+    {OptionKind::ForwardFlag, MaskSpirvContainer, "-fvk-use-scalar-layout", 0, nullptr,
      "use scalar memory layout"},
     {OptionKind::ForwardFlag, MaskSpirvClass, "-fvk-use-dx-position-w", 0, nullptr,
      "reciprocate SV_Position.w like DirectX"},
@@ -161,10 +176,10 @@ const OptionSpec OptionSpecs[] = {
     {OptionKind::ForwardFlag, MaskSpirvClass, "-fspv-use-vulkan-memory-model", 0,
      nullptr, "use the Vulkan memory model"},
 
-    GROUP(MaskSpirvClass, "SPIR-V code generation"),
-    {OptionKind::ForwardJoined, MaskSpirvClass, "-fspv-target-env", 1, "ENVIRONMENT",
+    GROUP(MaskSpirvContainer, "SPIR-V code generation"),
+    {OptionKind::ForwardJoined, MaskSpirvContainer, "-fspv-target-env", 1, "ENVIRONMENT",
      "SPIR-V target environment, e.g. vulkan1.2"},
-    {OptionKind::ForwardJoined, MaskSpirvClass, "-fspv-extension", 1, "EXTENSION",
+    {OptionKind::ForwardJoined, MaskSpirvContainer, "-fspv-extension", 1, "EXTENSION",
      "enable a SPIR-V extension (repeatable)"},
     {OptionKind::ForwardJoined, MaskSpirvClass, "-fspv-debug", 1, "MODE",
      "SPIR-V debug information mode"},
@@ -185,17 +200,18 @@ const OptionSpec OptionSpecs[] = {
     {OptionKind::ForwardJoined, MaskSpirv, "-Oconfig", 1, "PASSES",
      "custom SPIR-V optimization pass list"},
 
-    GROUP(MaskSlangClass, "Slang options"),
-    {OptionKind::ForwardSeparate, MaskSlangClass, "-lang", 1, "LANGUAGE",
+    GROUP(MaskSlangContainer, "Slang options"),
+    {OptionKind::ForwardSeparate, MaskSlangContainer, "-lang", 1, "LANGUAGE",
      "source language, e.g. hlsl or slang"},
-    {OptionKind::ForwardSeparate, MaskSlangClass, "-capability", 1, "CAPABILITY",
+    {OptionKind::ForwardSeparate, MaskSlangContainer, "-capability", 1, "CAPABILITY",
      "add a capability atom (repeatable)"},
-    {OptionKind::ForwardFlag, MaskSlangClass, "-unscoped-enum", 0, nullptr,
+    {OptionKind::ForwardFlag, MaskSlangContainer, "-unscoped-enum", 0, nullptr,
      "treat enums as unscoped"}
 };
 
 #undef GROUP
 
+// The container entry's Backend value is unused (ShaderToolOptions::Container).
 const BackendSpec BackendSpecs[] = {
     {"dxbc", ShaderToolBackend::Dxbc, MaskDxbc,
      "compile DXBC with D3DCompile (Shader Model 5_0/5_1)"},
@@ -208,10 +224,14 @@ const BackendSpec BackendSpecs[] = {
     {"slang-dxil", ShaderToolBackend::SlangDxil, MaskSlangDxil,
      "compile DXIL with Slang (Shader Model 6_0 or newer)"},
     {"slang-spirv", ShaderToolBackend::SlangSpirv, MaskSlangSpirv,
-     "compile SPIR-V with Slang (Shader Model 6_0 or newer)"}
+     "compile SPIR-V with Slang (Shader Model 6_0 or newer)"},
+    {"container", ShaderToolBackend::SlangDxil, MaskContainer,
+     "compile a Slang module into an NVRHI shader container (.nvsc)"}
 };
 
 const BackendSpec *FindBackend(const char *name) {
+    if (!strcmp(name, "--container"))
+        name = "container";
     for (const BackendSpec &backend : BackendSpecs)
         if (!strcmp(name, backend.Name))
             return &backend;
@@ -225,15 +245,21 @@ void PrintBackends(FILE *stream) {
 }
 
 void PrintGlobalUsage(const char *program) {
-    printf("Usage: %s <backend> [options] <source>\n\n", program);
+    printf("Usage: %s <backend> [options] <source>\n"
+           "       %s container --container-targets <list> [options] <source.slang>\n\n",
+           program, program);
     PrintBackends(stdout);
     printf(
         "\nRequired options:\n"
         "  -T <profile>                 full shader profile, e.g. ps_6_5 or vs_5_0\n"
+        "                               (not for 'container')\n"
         "  -Fo <file> | -Fh <file> -Vn <symbol>\n"
         "                               binary or C-header output (exactly one)\n"
         "\nThe single source file must be the last argument. -D NAME={a,b,c} defines\n"
         "a permutation axis; all axes combine into one NVSP blob artifact.\n"
+        "'container' (also spelled '--container') compiles every [shader(...)] entry\n"
+        "point of the module for each listed target (dxbc, dxil, spirv, ptx, optix)\n"
+        "into one container with the code and reflection of each target.\n"
         "Run '%s <backend> -h' for the options of one backend.\n",
         program);
 }
@@ -312,6 +338,50 @@ bool IsUnsignedNumber(const std::string &text) {
         if (!isdigit(static_cast<unsigned char>(character)))
             return false;
     return true;
+}
+
+// --container-targets: comma-separated, known names, no duplicates.
+int ParseContainerTargets(const std::string &list, std::vector<ContainerTarget> &targets) {
+    targets.clear();
+    size_t start = 0;
+    while (true) {
+        const size_t comma = list.find(',', start);
+        const std::string name =
+            list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        ContainerTarget target;
+        if (!ParseContainerTarget(name, target)) {
+            Error("unknown container target '%s'; expected dxbc, dxil, spirv, ptx or optix",
+                  name.c_str());
+            return -1;
+        }
+        for (ContainerTarget previous : targets) {
+            if (previous == target) {
+                Error("container target '%s' is listed twice", name.c_str());
+                return -1;
+            }
+        }
+        targets.push_back(target);
+        if (comma == std::string::npos)
+            break;
+        start = comma + 1;
+    }
+    return 0;
+}
+
+// --shader-model: <major>_<minor>, 6_0 or newer (it selects the DXIL profile sm_<model>).
+int ValidateShaderModel(const std::string &model) {
+    const size_t underscore = model.find('_');
+    if (underscore == std::string::npos || !IsUnsignedNumber(model.substr(0, underscore)) ||
+        !IsUnsignedNumber(model.substr(underscore + 1))) {
+        Error("invalid shader model '%s'; expected <major>_<minor>, e.g. 6_5", model.c_str());
+        return -1;
+    }
+    if (strtoul(model.c_str(), nullptr, 10) < 6) {
+        Error("the container's shader model must be 6_0 or newer (got '%s'); the dxbc "
+              "target always uses 5_0", model.c_str());
+        return -1;
+    }
+    return 0;
 }
 
 bool IsRegisterShiftOption(const OptionSpec &spec) {
@@ -426,10 +496,12 @@ OptionsParseStatus ShaderToolOptionsParse(int argc, const char *const *argv,
     }
     options.Backend = backend->Backend;
     options.BackendName = backend->Name;
+    options.Container = (backend->Mask & MaskContainer) != 0;
 
     int optimization_level = 3;
     bool seen_entry = false, seen_profile = false, seen_variable = false;
     bool seen_binary = false, seen_header = false, seen_depfile = false;
+    bool seen_targets = false, seen_optix = false, seen_model = false;
 
     int index = 2;
     while (index < argc) {
@@ -580,6 +652,33 @@ OptionsParseStatus ShaderToolOptionsParse(int argc, const char *const *argv,
         case OptionKind::OptimizationLevel:
             optimization_level = spec.Name[2] - '0';
             break;
+        case OptionKind::ContainerTargets:
+            if (seen_targets) {
+                Error("--container-targets may be specified at most once");
+                return OptionsParseStatus::Error;
+            }
+            seen_targets = true;
+            if (ParseContainerTargets(values[0], options.ContainerTargets))
+                return OptionsParseStatus::Error;
+            break;
+        case OptionKind::OptixInclude:
+            if (seen_optix) {
+                Error("--optix-include may be specified at most once");
+                return OptionsParseStatus::Error;
+            }
+            seen_optix = true;
+            options.OptixIncludeDir = values[0];
+            break;
+        case OptionKind::ShaderModel:
+            if (seen_model) {
+                Error("--shader-model may be specified at most once");
+                return OptionsParseStatus::Error;
+            }
+            seen_model = true;
+            if (ValidateShaderModel(values[0]))
+                return OptionsParseStatus::Error;
+            options.ShaderModel = values[0];
+            break;
         case OptionKind::ForwardFlag:
             options.ExtraArgs.emplace_back(spec.Name);
             break;
@@ -598,7 +697,11 @@ OptionsParseStatus ShaderToolOptionsParse(int argc, const char *const *argv,
         Error("exactly one source file is required as the final argument");
         return OptionsParseStatus::Error;
     }
-    if (!seen_profile) {
+    if (options.Container && !seen_targets) {
+        Error("--container-targets <list> is required in container mode");
+        return OptionsParseStatus::Error;
+    }
+    if (!options.Container && !seen_profile) {
         Error("-T <profile> is required");
         return OptionsParseStatus::Error;
     }
@@ -618,7 +721,7 @@ OptionsParseStatus ShaderToolOptionsParse(int argc, const char *const *argv,
         Error("-E requires a non-empty entry point name");
         return OptionsParseStatus::Error;
     }
-    if (ValidateProfile(options, backend->Mask))
+    if (!options.Container && ValidateProfile(options, backend->Mask))
         return OptionsParseStatus::Error;
     if (RejectStrayBraces(options))
         return OptionsParseStatus::Error;

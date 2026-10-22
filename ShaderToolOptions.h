@@ -6,13 +6,21 @@
 #include <vector>
 
 #include "CompilerLibrary.h"
+#include "ContainerCompiler.h"
 
 // Parsed, validated command line for one ShaderTool invocation.
 // Defines are stored raw: values may still contain a single {a,b,c} variant
 // group; the driver expands them into the cartesian variant set.
 struct ShaderToolOptions {
-    ShaderToolBackend Backend = ShaderToolBackend::Dxbc;
+    ShaderToolBackend Backend = ShaderToolBackend::Dxbc; // unused in container mode
     std::string BackendName;
+    // Container mode ('container' / '--container' subcommand): the whole module
+    // compiled into one NVRHI shader container; -E, -T and permutation axes do
+    // not apply.
+    bool Container = false;
+    std::vector<ContainerTarget> ContainerTargets; // --container-targets
+    std::string OptixIncludeDir;                   // --optix-include
+    std::string ShaderModel = "6_5";               // --shader-model (DXIL)
     std::string Source;
     std::string EntryPoint = "main";
     std::string Profile;

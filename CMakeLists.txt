@@ -38,16 +38,24 @@ add_executable(ShaderTool
     ShaderTool.cpp
     ShaderToolOptions.cpp
     CompilerLibrary.cpp
+    ContainerCompiler.cpp
+    ContainerWriter.cpp
     Depfile.cpp
     HeaderOutput.cpp
     ShaderToolBlob.c
     ShaderToolOptions.h
     CompilerLibrary.h
+    ContainerCompiler.h
+    ContainerWriter.h
     Depfile.h
     HeaderOutput.h
-    ShaderToolBlob.h)
+    ShaderToolBlob.h
+    include/nvrhi-shader-container.h)
 add_executable(ShaderTool::ShaderTool ALIAS ShaderTool)
 target_compile_features(ShaderTool PRIVATE cxx_std_17 c_std_11)
+# include/nvrhi-shader-container.h: byte-identical copy of NVRHI's
+# <nvrhi/shader-container.h> (the container format; the aggregate checks the copies).
+target_include_directories(ShaderTool PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(ShaderTool PRIVATE
     ShaderTool::dxcompiler
     ShaderTool::slang)
@@ -76,6 +84,50 @@ endif()
 add_executable(ShaderToolBlobTests tests/BlobTests.c)
 target_link_libraries(ShaderToolBlobTests PRIVATE ShaderTool::Blob)
 add_test(NAME ShaderToolBlobTests COMMAND ShaderToolBlobTests)
+
+# Shader container tests (standalone builds only: they use
+# shadertool_add_shader_containers(), whose module a parent project includes
+# itself). The containers are built by a ctest fixture so that the default
+# build needs neither NVRTC nor the OptiX SDK; ptx/optix are tested when
+# OptiX_INSTALL_DIR is set (NVRTC must then be on PATH as well).
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/ShaderToolFunctions.cmake")
+
+    if(DEFINED ENV{OptiX_INSTALL_DIR})
+        set(_shadertool_test_targets_default "ptx;optix;dxil;spirv")
+    else()
+        set(_shadertool_test_targets_default "dxil;spirv")
+    endif()
+    set(SHADERTOOL_CONTAINER_TEST_TARGETS "${_shadertool_test_targets_default}"
+        CACHE STRING "Container targets compiled by the ShaderTool container tests")
+
+    add_executable(ShaderToolContainerTests tests/ContainerTests.cpp)
+    target_compile_features(ShaderToolContainerTests PRIVATE cxx_std_17)
+    target_include_directories(ShaderToolContainerTests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+    set(_shadertool_test_dir "${CMAKE_CURRENT_BINARY_DIR}/container-tests")
+    shadertool_add_shader_containers(
+        TARGET ShaderToolContainerTestShaders
+        SOURCES tests/container/compute.slang tests/container/raytracing.slang
+        BASE_DIRECTORY tests/container
+        TARGETS ${SHADERTOOL_CONTAINER_TEST_TARGETS}
+        OUTPUT_DIR "${_shadertool_test_dir}")
+
+    add_test(NAME ShaderToolContainerBuild
+        COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"
+            --target ShaderToolContainerTestShaders --config "$<CONFIG>")
+    set_tests_properties(ShaderToolContainerBuild PROPERTIES
+        FIXTURES_SETUP ShaderToolContainers)
+    string(REPLACE ";" "," _shadertool_test_target_list "${SHADERTOOL_CONTAINER_TEST_TARGETS}")
+    add_test(NAME ShaderToolContainerTests
+        COMMAND ShaderToolContainerTests
+            --targets "${_shadertool_test_target_list}"
+            --compute "${_shadertool_test_dir}/compute.nvsc"
+            --raytracing "${_shadertool_test_dir}/raytracing.nvsc")
+    set_tests_properties(ShaderToolContainerTests PROPERTIES
+        FIXTURES_REQUIRED ShaderToolContainers)
+endif()
 
 # ---------------------------------------------------------------------------
 # Package config (build tree + install tree)

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "CompilerLibrary.h"
+#include "ContainerCompiler.h"
 #include "Depfile.h"
 #include "HeaderOutput.h"
 #include "ShaderToolBlob.h"
@@ -185,6 +186,52 @@ void PrintDiagnostics(const std::string &diagnostics, const std::string &key,
         fputc('\n', stderr);
 }
 
+// Writes the artifact (-Fo binary or -Fh header) and, with -depfile, the
+// dependency file (the source plus every resolved include).
+int WriteOutputs(const ShaderToolOptions &options, const std::vector<uint8_t> &artifact,
+                 const std::vector<std::string> &includes) {
+    const std::string &target = options.OutputPath();
+    if (EnsureParentDirectory(target))
+        return 1;
+    if (options.HeaderOutput()) {
+        if (HeaderOutputWrite(options.HeaderOutputPath, options.HeaderVariableName,
+                              artifact.data(), artifact.size())) {
+            Error("failed to write header output '%s'",
+                  options.HeaderOutputPath.c_str());
+            return 1;
+        }
+    } else {
+        if (WriteBinaryFileIfChanged(options.BinaryOutputPath, artifact.data(),
+                                     artifact.size()))
+            return 1;
+    }
+
+    if (!options.DepfilePath.empty()) {
+        std::vector<std::string> dependencies;
+        // The source is typically invoked with a config-relative path, but ninja
+        // resolves depfile entries against the build directory - record it absolute.
+        std::error_code absolute_error;
+        std::filesystem::path absolute_source =
+            std::filesystem::absolute(options.Source, absolute_error);
+        dependencies.push_back(absolute_error ? options.Source
+                                              : absolute_source.string());
+        for (const std::string &include : includes) {
+            std::filesystem::path absolute_include =
+                std::filesystem::absolute(include, absolute_error);
+            dependencies.push_back(absolute_error ? include
+                                                  : absolute_include.string());
+        }
+        if (EnsureParentDirectory(options.DepfilePath))
+            return 1;
+        if (DepfileWrite(options.DepfilePath, target, dependencies)) {
+            Error("failed to write depfile '%s'", options.DepfilePath.c_str());
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 int RunShaderTool(const ShaderToolOptions &options) {
     std::vector<DefineList> variants;
     if (ExpandDefineVariants(options.Defines, variants))
@@ -262,48 +309,42 @@ int RunShaderTool(const ShaderToolOptions &options) {
         }
     }
 
-    const std::string &target = options.OutputPath();
-    if (EnsureParentDirectory(target))
+    std::vector<std::string> includes;
+    for (const CompileVariantResult &result : results)
+        includes.insert(includes.end(), result.Includes.begin(), result.Includes.end());
+    return WriteOutputs(options, artifact, includes);
+}
+
+// Container mode: the whole module, every listed target, one .nvsc artifact.
+int RunContainer(const ShaderToolOptions &options) {
+    std::vector<DefineList> variants;
+    if (ExpandDefineVariants(options.Defines, variants))
         return 1;
-    if (options.HeaderOutput()) {
-        if (HeaderOutputWrite(options.HeaderOutputPath, options.HeaderVariableName,
-                              artifact.data(), artifact.size())) {
-            Error("failed to write header output '%s'",
-                  options.HeaderOutputPath.c_str());
-            return 1;
-        }
-    } else {
-        if (WriteBinaryFileIfChanged(options.BinaryOutputPath, artifact.data(),
-                                     artifact.size()))
-            return 1;
+    if (variants.size() != 1) {
+        Error("permutation axes (-D NAME={a,b}) are not supported in container mode; "
+              "build one container per permutation");
+        return 1;
     }
 
-    if (!options.DepfilePath.empty()) {
-        std::vector<std::string> dependencies;
-        // The source is typically invoked with a config-relative path, but ninja
-        // resolves depfile entries against the build directory - record it absolute.
-        std::error_code absolute_error;
-        std::filesystem::path absolute_source =
-            std::filesystem::absolute(options.Source, absolute_error);
-        dependencies.push_back(absolute_error ? options.Source
-                                              : absolute_source.string());
-        for (const CompileVariantResult &result : results) {
-            for (const std::string &include : result.Includes) {
-                std::filesystem::path absolute_include =
-                    std::filesystem::absolute(include, absolute_error);
-                dependencies.push_back(absolute_error ? include
-                                                      : absolute_include.string());
-            }
-        }
-        if (EnsureParentDirectory(options.DepfilePath))
-            return 1;
-        if (DepfileWrite(options.DepfilePath, target, dependencies)) {
-            Error("failed to write depfile '%s'", options.DepfilePath.c_str());
-            return 1;
-        }
-    }
+    ContainerCompileRequest request;
+    request.Source = options.Source;
+    request.Defines = variants[0];
+    request.Defines.insert(request.Defines.end(), options.UnkeyedDefines.begin(),
+                           options.UnkeyedDefines.end());
+    request.IncludeDirs = options.IncludeDirs;
+    request.ExtraArgs = options.ExtraArgs;
+    request.Targets = options.ContainerTargets;
+    request.ShaderModel = options.ShaderModel;
+    request.OptixIncludeDir = options.OptixIncludeDir;
 
-    return 0;
+    ContainerCompileResult result;
+    const int status = CompileShaderContainer(request, result);
+    PrintDiagnostics(result.Diagnostics, std::string(), false);
+    if (status != 0) {
+        Error("failed to compile '%s' into a shader container", options.Source.c_str());
+        return 1;
+    }
+    return WriteOutputs(options, result.Container, result.Includes);
 }
 
 } // namespace
@@ -319,7 +360,7 @@ int main(int argc, char **argv) {
         case OptionsParseStatus::Ok:
             break;
         }
-        return RunShaderTool(options);
+        return options.Container ? RunContainer(options) : RunShaderTool(options);
     } catch (const std::exception &error) {
         fprintf(stderr, "ShaderTool: fatal: %s\n", error.what());
         return 1;

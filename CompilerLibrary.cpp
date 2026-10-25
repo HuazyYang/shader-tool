@@ -723,9 +723,9 @@ int TranslateSlangExtraArgs(SlangCompileRequest *compile,
                ShaderMake likewise never forwarded these to slang. */
         } else if (argument == "-g") {
             spSetDebugInfoLevel(compile, SLANG_DEBUG_INFO_LEVEL_STANDARD);
-        } else if (argument == "-capability") {
+        } else if (argument == "-capability" || argument == "-fp-mode") {
             if (i + 1 >= extra_args.size()) {
-                AppendToolError(diagnostics, "-capability requires a value");
+                AppendToolError(diagnostics, argument + " requires a value");
                 return -1;
             }
             cli_args.push_back(argument);

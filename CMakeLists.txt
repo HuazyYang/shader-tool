@@ -114,9 +114,33 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         TARGETS ${SHADERTOOL_CONTAINER_TEST_TARGETS}
         OUTPUT_DIR "${_shadertool_test_dir}")
 
+    # CUDA-only code (no D3D layout), ptx only, built twice to compare the floating-point modes.
+    set(_shadertool_test_build_targets ShaderToolContainerTestShaders)
+    set(_shadertool_test_cudaonly_args)
+    if("ptx" IN_LIST SHADERTOOL_CONTAINER_TEST_TARGETS)
+        shadertool_add_shader_containers(
+            TARGET ShaderToolContainerTestCudaOnly
+            SOURCES tests/container/cudaonly.slang
+            BASE_DIRECTORY tests/container
+            TARGETS ptx
+            OUTPUT_DIR "${_shadertool_test_dir}")
+        shadertool_add_shader_containers(
+            TARGET ShaderToolContainerTestCudaOnlyFast
+            SOURCES tests/container/cudaonly.slang
+            BASE_DIRECTORY tests/container
+            TARGETS ptx
+            EXTRA_FLAGS -fp-mode fast
+            OUTPUT_DIR "${_shadertool_test_dir}/fast")
+        list(APPEND _shadertool_test_build_targets
+            ShaderToolContainerTestCudaOnly ShaderToolContainerTestCudaOnlyFast)
+        set(_shadertool_test_cudaonly_args
+            --cudaonly "${_shadertool_test_dir}/cudaonly.nvsc"
+            --cudaonly-fast "${_shadertool_test_dir}/fast/cudaonly.nvsc")
+    endif()
+
     add_test(NAME ShaderToolContainerBuild
         COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"
-            --target ShaderToolContainerTestShaders --config "$<CONFIG>")
+            --target ${_shadertool_test_build_targets} --config "$<CONFIG>")
     set_tests_properties(ShaderToolContainerBuild PROPERTIES
         FIXTURES_SETUP ShaderToolContainers)
     string(REPLACE ";" "," _shadertool_test_target_list "${SHADERTOOL_CONTAINER_TEST_TARGETS}")
@@ -124,7 +148,8 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
         COMMAND ShaderToolContainerTests
             --targets "${_shadertool_test_target_list}"
             --compute "${_shadertool_test_dir}/compute.nvsc"
-            --raytracing "${_shadertool_test_dir}/raytracing.nvsc")
+            --raytracing "${_shadertool_test_dir}/raytracing.nvsc"
+            ${_shadertool_test_cudaonly_args})
     set_tests_properties(ShaderToolContainerTests PROPERTIES
         FIXTURES_REQUIRED ShaderToolContainers)
 endif()

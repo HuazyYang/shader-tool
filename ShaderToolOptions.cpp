@@ -206,7 +206,9 @@ const OptionSpec OptionSpecs[] = {
     {OptionKind::ForwardSeparate, MaskSlangContainer, "-capability", 1, "CAPABILITY",
      "add a capability atom (repeatable)"},
     {OptionKind::ForwardFlag, MaskSlangContainer, "-unscoped-enum", 0, nullptr,
-     "treat enums as unscoped"}
+     "treat enums as unscoped"},
+    {OptionKind::ForwardSeparate, MaskSlangContainer, "-fp-mode", 1, "MODE",
+     "floating-point mode: precise, fast or default (fast: NVRTC --use_fast_math)"}
 };
 
 #undef GROUP

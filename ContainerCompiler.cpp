@@ -137,6 +137,8 @@ struct SlangArguments {
     /* Row-major unless -Zpc: the default of both Slang APIs and therefore of ShaderTool's
        other slang backends (only slangc's command line defaults to column-major). */
     bool RowMajor = true;
+    /* -fp-mode: a target setting in Slang (SlangTargetDesc::floatingPointMode); fast is NVRTC's --use_fast_math. */
+    SlangFloatingPointMode FloatingPointMode = SLANG_FLOATING_POINT_MODE_DEFAULT;
 };
 
 bool SpirvProfileForTargetEnv(const std::string &environment, std::string &profile) {
@@ -198,6 +200,18 @@ int TranslateExtraArgs(const std::vector<std::string> &extra_args, SlangArgument
             }
             out.Common.push_back(argument);
             out.Common.push_back(extra_args[++i]);
+        } else if (argument == "-fp-mode") {
+            const std::string mode = i + 1 < extra_args.size() ? extra_args[++i] : std::string();
+            if (mode == "fast")
+                out.FloatingPointMode = SLANG_FLOATING_POINT_MODE_FAST;
+            else if (mode == "precise")
+                out.FloatingPointMode = SLANG_FLOATING_POINT_MODE_PRECISE;
+            else if (mode == "default")
+                out.FloatingPointMode = SLANG_FLOATING_POINT_MODE_DEFAULT;
+            else {
+                sink.Error("-fp-mode requires precise, fast or default");
+                return -1;
+            }
         } else if (argument == "-fvk-use-entrypoint-name" ||
                    argument == "-fvk-use-dx-layout" || argument == "-fvk-use-gl-layout") {
             out.Spirv.push_back(argument);
@@ -610,6 +624,30 @@ bool ContainsUnboundedArray(slang::TypeLayoutReflection *layout, int depth = 0) 
     }
 }
 
+/* Data without resources: what a kernel argument or SLANG_globalParams holds by value
+   (pointers and descriptor handles included). */
+bool IsOrdinaryData(slang::TypeLayoutReflection *layout, int depth = 0) {
+    if (!layout || depth > 32)
+        return false;
+    switch (layout->getKind()) {
+    case slang::TypeReflection::Kind::Scalar:
+    case slang::TypeReflection::Kind::Vector:
+    case slang::TypeReflection::Kind::Matrix:
+    case slang::TypeReflection::Kind::Pointer:
+    case slang::TypeReflection::Kind::Enum:
+        return true;
+    case slang::TypeReflection::Kind::Array:
+        return IsOrdinaryData(layout->getElementTypeLayout(), depth + 1);
+    case slang::TypeReflection::Kind::Struct:
+        for (unsigned i = 0; i < layout->getFieldCount(); ++i)
+            if (!IsOrdinaryData(layout->getFieldByIndex(i)->getTypeLayout(), depth + 1))
+                return false;
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* A D3D register (space, slot) or Vulkan (set, binding). */
 struct Binding {
     uint32_t Space = 0;
@@ -730,6 +768,15 @@ public:
                     return -1;
                 }
             }
+            /* A [[vk::push_constant]] constant buffer needs no register: the backend finds it by kind. */
+            if (IsPtx(Target) && register_layout == layout && !IsOrdinaryData(var->getTypeLayout()) &&
+                !IsPushConstant(var->getTypeLayout(), var, var)) {
+                Sink.Error(std::string("global parameter '") + Name(var) + "' needs a D3D register, "
+                           "but the program does not compile for D3D (CUDA-only code); pass the "
+                           "resource as a kernel argument (a pointer or a descriptor handle) or in a "
+                           "[[vk::push_constant]] constant buffer");
+                return -1;
+            }
             if (IsPtx(Target) && ContainsUnboundedArray(var->getTypeLayout())) {
                 Sink.Error(std::string("global parameter '") + Name(var) + "': unsized arrays "
                            "are not supported on the CUDA/OptiX targets (Slang moves them to "
@@ -786,6 +833,14 @@ public:
             if (size) {
                 record.paramsAlignment = LayoutAlignment(block);
                 record.paramsSize = AlignUp(size, record.paramsAlignment);
+            }
+            if (Target == ContainerTarget::CudaPtx) {
+                /* cuLaunchKernel takes the kernel parameters only at their exact size: up to the end of
+                   the last one, without the trailing padding of a struct. */
+                uint32_t end = 0;
+                for (uint32_t i = record.firstParameter; i < Out.Parameters.size(); ++i)
+                    end = std::max(end, Out.Parameters[i].uniformOffset + Out.Parameters[i].uniformSize);
+                record.paramsSize = end;
             }
         }
         Out.EntryPoints.push_back(record);
@@ -939,7 +994,15 @@ private:
 
         uint32_t kind = 0, dimension = 0;
         std::string problem;
-        if (!Classify(element, var, register_var, kind, dimension, problem)) {
+        const slang::TypeReflection::Kind element_kind = element->getKind();
+        if (IsPtx(Target) && (flags & NVRHI_SC_PARAM_FLAG_ENTRY_POINT) &&
+            (element_kind == slang::TypeReflection::Kind::Resource ||
+             element_kind == slang::TypeReflection::Kind::SamplerState)) {
+            /* A resource among the kernel arguments is its handle (a CUDA texture or surface
+               object, as DescriptorHandle<T> is on CUDA): data the caller writes into the
+               argument block, nothing a binding set provides. */
+            kind = NVRHI_SC_PARAM_UNIFORM;
+        } else if (!Classify(element, var, register_var, kind, dimension, problem)) {
             Sink.Error(std::string("parameter '") + Name(var) + "' of type '" +
                        TypeName(element->getType()) + "': " + problem +
                        " cannot be described in an NVRHI shader container");
@@ -1177,6 +1240,7 @@ struct ModuleInputs {
     std::string SpirvProfile;
     std::string D3DProfile; /* sm_<model> */
     bool RowMajor = false;
+    SlangFloatingPointMode FloatingPointMode = SLANG_FLOATING_POINT_MODE_DEFAULT;
     std::string OptixArguments;
     std::vector<slang::CompilerOptionEntry> OptixEntries;
 };
@@ -1188,8 +1252,7 @@ struct SessionTarget {
     bool SpirvOptions = false;
 };
 
-/* 'target' selects the session-wide extras of the PTX targets (none for the discovery
-   session, which passes ContainerTarget::Dxil). */
+/* 'target' selects the session-wide extras of the PTX targets. */
 int CreateSession(const ModuleInputs &inputs, const std::vector<SessionTarget> &targets,
                   ContainerTarget target, ComPtr<slang::ISession> &session,
                   DiagnosticSink &sink) {
@@ -1205,6 +1268,7 @@ int CreateSession(const ModuleInputs &inputs, const std::vector<SessionTarget> &
             }
         }
         descs[i].flags |= targets[i].ExtraFlags;
+        descs[i].floatingPointMode = inputs.FloatingPointMode;
         if (targets[i].SpirvOptions && !inputs.Spirv.Entries.empty()) {
             descs[i].compilerOptionEntries = inputs.Spirv.Entries.data();
             descs[i].compilerOptionEntryCount = (uint32_t)inputs.Spirv.Entries.size();
@@ -1300,6 +1364,50 @@ bool TargetAccepts(ContainerTarget target, SlangStage stage) {
     return false;
 }
 
+slang::EntryPointReflection *FindEntryPoint(slang::ProgramLayout *layout, const char *name) {
+    for (SlangUInt i = 0; name && i < layout->getEntryPointCount(); ++i) {
+        slang::EntryPointReflection *entry = layout->getEntryPointByIndex(i);
+        if (entry->getName() && !strcmp(entry->getName(), name))
+            return entry;
+    }
+    return nullptr;
+}
+
+/* The D3D layout of the program a PTX target compiles (the 'selected' entry points): the
+   registers of its global resources, the HLSL-to-CUDA cross-map. Null when the program does
+   not compile for D3D, which is the case of CUDA-only code (pointers, descriptor handles made
+   from integers, ...); such code passes its resources as kernel arguments. The session and the
+   program keep the layout alive. */
+slang::ProgramLayout *D3DRegisterLayout(const ModuleInputs &inputs,
+                                        const std::vector<std::string> &selected,
+                                        ComPtr<slang::ISession> &session,
+                                        ComPtr<slang::IComponentType> &linked) {
+    std::string ignored;
+    DiagnosticSink quiet(ignored);
+    std::vector<SessionTarget> targets(1);
+    targets[0].Format = SLANG_DXIL;
+    targets[0].Profile = inputs.D3DProfile;
+    if (CreateSession(inputs, targets, ContainerTarget::Dxil, session, quiet))
+        return nullptr;
+    slang::IModule *module = LoadModule(session, inputs, quiet);
+    std::vector<EntryPointInfo> entries;
+    if (!module || GetEntryPoints(module, entries, quiet))
+        return nullptr;
+
+    std::vector<slang::IComponentType *> components{module};
+    for (const EntryPointInfo &entry : entries)
+        if (std::find(selected.begin(), selected.end(), entry.Name) != selected.end())
+            components.push_back(entry.EntryPoint.get());
+    ComPtr<slang::IComponentType> composite;
+    ComPtr<slang::IBlob> diagnostics;
+    if (SLANG_FAILED(session->createCompositeComponentType(
+            components.data(), (SlangInt)components.size(), composite.writeRef(),
+            diagnostics.writeRef())) ||
+        SLANG_FAILED(composite->link(linked.writeRef(), diagnostics.writeRef())) || !linked)
+        return nullptr;
+    return linked->getLayout(0, diagnostics.writeRef());
+}
+
 /* Compiles the module for one target and appends its CODE and REFLECTION sections. A target
    with no entry points it can hold is skipped (*skipped set). */
 int CompileTarget(const ModuleInputs &inputs, ContainerTarget target,
@@ -1360,11 +1468,9 @@ int CompileTarget(const ModuleInputs &inputs, ContainerTarget target,
         break;
     case ContainerTarget::CudaPtx:
     case ContainerTarget::OptixPtx:
+        /* The D3D registers of the same program (the cross-map) come from a session of their
+           own (D3DRegisterLayout): CUDA-only code does not load for D3D at all. */
         targets[0].Format = SLANG_PTX;
-        /* Layout only: the D3D registers of the same program (the cross-map). */
-        targets.resize(2);
-        targets[1].Format = SLANG_DXIL;
-        targets[1].Profile = inputs.D3DProfile;
         break;
     }
 
@@ -1429,14 +1535,17 @@ int CompileTarget(const ModuleInputs &inputs, ContainerTarget target,
 
     slang::ProgramLayout *layout = linked->getLayout(0, diagnostics.writeRef());
     sink.Add(diagnostics);
-    slang::ProgramLayout *register_layout = layout;
-    if (IsPtx(target)) {
-        register_layout = linked->getLayout(1, diagnostics.writeRef());
-        sink.Add(diagnostics);
-    }
-    if (!layout || !register_layout) {
+    if (!layout) {
         sink.Error(std::string("slang produced no layout for the ") + info.Name + " target");
         return -1;
+    }
+    slang::ProgramLayout *register_layout = layout;
+    ComPtr<slang::ISession> register_session;
+    ComPtr<slang::IComponentType> register_program;
+    if (IsPtx(target)) {
+        register_layout = D3DRegisterLayout(inputs, selected, register_session, register_program);
+        if (!register_layout)
+            register_layout = layout;   /* CUDA-only code: no global resources (AddGlobals) */
     }
 
     ContainerReflection reflection;
@@ -1453,7 +1562,7 @@ int CompileTarget(const ModuleInputs &inputs, ContainerTarget target,
     for (SlangUInt i = 0; i < layout->getEntryPointCount(); ++i) {
         slang::EntryPointReflection *entry = layout->getEntryPointByIndex(i);
         slang::EntryPointReflection *register_entry =
-            register_layout == layout ? entry : register_layout->getEntryPointByIndex(i);
+            register_layout == layout ? entry : FindEntryPoint(register_layout, entry->getName());
         std::string symbol;
         if (ResolveSymbolName(target, entry, layout, ptx_entries, spirv_entries, symbol, sink))
             return -1;
@@ -1537,6 +1646,7 @@ int Compile(const ContainerCompileRequest &request, ContainerCompileResult &resu
         return -1;
     inputs.SpirvProfile = arguments.SpirvProfile;
     inputs.RowMajor = arguments.RowMajor;
+    inputs.FloatingPointMode = arguments.FloatingPointMode;
     inputs.D3DProfile = "sm_" + request.ShaderModel;
 
     const bool wants_optix = std::find(request.Targets.begin(), request.Targets.end(),
@@ -1564,14 +1674,34 @@ int Compile(const ContainerCompileRequest &request, ContainerCompileResult &resu
     }
 
     /* Discovery: parse and check the module once (front-end errors are reported here, once),
-       collect its entry points and the files it depends on. */
+       collect its entry points and the files it depends on. The module is checked for the
+       first requested target: code written for one target family (CUDA-only code with
+       pointers and descriptor handles, say) need not load for the others. */
     std::vector<EntryPointInfo> discovered;
     {
+        const ContainerTarget first = request.Targets.front();
         std::vector<SessionTarget> targets(1);
-        targets[0].Format = SLANG_DXIL;
-        targets[0].Profile = inputs.D3DProfile;
+        switch (first) {
+        case ContainerTarget::Dxbc:
+            targets[0].Format = SLANG_DXBC;
+            targets[0].Profile = "sm_5_0";
+            break;
+        case ContainerTarget::Dxil:
+            targets[0].Format = SLANG_DXIL;
+            targets[0].Profile = inputs.D3DProfile;
+            break;
+        case ContainerTarget::Spirv:
+            targets[0].Format = SLANG_SPIRV;
+            targets[0].Profile = inputs.SpirvProfile;
+            targets[0].SpirvOptions = true;
+            break;
+        case ContainerTarget::CudaPtx:
+        case ContainerTarget::OptixPtx:
+            targets[0].Format = SLANG_PTX;
+            break;
+        }
         ComPtr<slang::ISession> session;
-        if (CreateSession(inputs, targets, ContainerTarget::Dxil, session, sink))
+        if (CreateSession(inputs, targets, first, session, sink))
             return -1;
         slang::IModule *module = LoadModule(session, inputs, sink);
         if (!module)

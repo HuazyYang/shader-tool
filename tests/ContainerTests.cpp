@@ -2,6 +2,7 @@
 
      ShaderToolContainerTests --targets ptx,optix,dxil,spirv
                               --compute <compute.nvsc> --raytracing <raytracing.nvsc>
+                              [--cudaonly <cudaonly.nvsc> --cudaonly-fast <cudaonly-fast.nvsc>]
      ShaderToolContainerTests --dump <file.nvsc>
 
    The reader below validates everything NVRHI's parser (src/common/shader-container.cpp)
@@ -779,6 +780,82 @@ void CheckRayTracing(const char *path, const std::vector<uint32_t> &requested) {
     }
 }
 
+/* The PTX text of a container's ptx section. */
+std::string PtxText(const Container &container) {
+    const Section *code = FindSection(container, NVRHI_SC_SECTION_CODE, NVRHI_SC_TARGET_CUDA_PTX);
+    if (!code || code->Data.empty())
+        return std::string();
+    return std::string(code->Data.begin(), code->Data.end() - (code->Data.back() == 0 ? 1 : 0));
+}
+
+/* tests/container/cudaonly.slang: CUDA-only code (no D3D layout). Built twice: 'path' with the default
+   floating-point mode, 'fast_path' with -fp-mode fast. */
+void CheckCudaOnly(const char *path, const char *fast_path) {
+    printf("cuda-only: %s, %s\n", path, fast_path);
+    Container container;
+    if (!LoadContainer(path, {NVRHI_SC_TARGET_CUDA_PTX}, container))
+        return;
+    Reflection r;
+    if (!GetReflection(container, NVRHI_SC_TARGET_CUDA_PTX, r))
+        return;
+    const Section *code = FindSection(container, NVRHI_SC_SECTION_CODE, NVRHI_SC_TARGET_CUDA_PTX);
+    CHECK(code != nullptr);
+    if (code)
+        CheckPtx(*code, r);
+
+    /* A [[vk::push_constant]] block needs no register: it is found by its kind. A plain data global is
+       allowed too. */
+    CHECK_EQ(r.Header.globalParameterCount, 2u);
+    const NvrhiScParameter *constants = FindGlobal(r, "g_Constants");
+    const NvrhiScParameter *plain = FindGlobal(r, "g_Plain");
+    CHECK(constants && plain);
+    if (constants && plain) {
+        CHECK_EQ(constants->kind, NVRHI_SC_PARAM_PUSH_CONSTANTS);
+        CHECK_EQ(constants->uniformOffset, 0u);
+        CHECK_EQ(constants->uniformSize, 8u); /* the address of the push constants */
+        CHECK_EQ(plain->kind, NVRHI_SC_PARAM_UNIFORM);
+        CHECK_EQ(plain->uniformOffset, 8u);
+        CHECK_EQ(plain->uniformSize, 4u);
+    }
+    CHECK_EQ(r.Header.globalParamsSize, 16u);
+    CHECK_EQ(r.Header.globalParamsAlignment, 8u);
+
+    /* Pointers and descriptor handles are entry-point uniform data. */
+    const NvrhiScEntryPoint *entry = FindEntry(r, "fill");
+    CHECK(entry != nullptr);
+    if (entry) {
+        CHECK_EQ(entry->stage, NVRHI_SC_STAGE_COMPUTE);
+        CHECK_EQ(entry->threadGroupSize[0], 32u);
+        CHECK_EQ(entry->parameterCount, 2u);
+        const NvrhiScParameter *values = FindEntryParameter(r, entry, "values");
+        const NvrhiScParameter *surface = FindEntryParameter(r, entry, "surface");
+        CHECK(values && surface);
+        if (values && surface) {
+            CHECK_EQ(values->kind, NVRHI_SC_PARAM_UNIFORM);
+            CHECK_EQ(values->uniformOffset, 0u);
+            CHECK_EQ(values->uniformSize, 8u);
+            CHECK_EQ(surface->kind, NVRHI_SC_PARAM_UNIFORM); /* a handle, not a bindable resource */
+            CHECK_EQ(surface->uniformOffset, 8u);
+            CHECK_EQ(surface->uniformSize, 8u);
+        }
+        CHECK_EQ(entry->paramsSize, 16u); /* the exact end of the last parameter */
+    }
+
+    /* -fp-mode: IEEE division and square root by default, approximate (NVRTC --use_fast_math) with fast. */
+    const std::string precise = PtxText(container);
+    CHECK(precise.find("div.rn.f32") != std::string::npos);
+    CHECK(precise.find("sqrt.rn.f32") != std::string::npos);
+    CHECK(precise.find("approx.ftz") == std::string::npos);
+    Container fast_container;
+    if (LoadContainer(fast_path, {NVRHI_SC_TARGET_CUDA_PTX}, fast_container)) {
+        const std::string fast = PtxText(fast_container);
+        CHECK(fast.find("div.approx.ftz.f32") != std::string::npos);
+        CHECK(fast.find("sqrt.approx.ftz.f32") != std::string::npos);
+        CHECK(fast.find("div.rn.f32") == std::string::npos);
+        CHECK(fast.find("sqrt.rn.f32") == std::string::npos);
+    }
+}
+
 bool ParseTargetList(const char *list, std::vector<uint32_t> &targets) {
     std::string text(list);
     size_t start = 0;
@@ -810,6 +887,8 @@ int main(int argc, char **argv) {
     std::vector<uint32_t> targets;
     const char *compute = nullptr;
     const char *raytracing = nullptr;
+    const char *cuda_only = nullptr;
+    const char *cuda_only_fast = nullptr;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!strcmp(argv[i], "--targets")) {
             if (!ParseTargetList(argv[i + 1], targets))
@@ -818,13 +897,18 @@ int main(int argc, char **argv) {
             compute = argv[i + 1];
         } else if (!strcmp(argv[i], "--raytracing")) {
             raytracing = argv[i + 1];
+        } else if (!strcmp(argv[i], "--cudaonly")) {
+            cuda_only = argv[i + 1];
+        } else if (!strcmp(argv[i], "--cudaonly-fast")) {
+            cuda_only_fast = argv[i + 1];
         } else {
             printf("unknown argument '%s'\n", argv[i]);
             return 2;
         }
     }
-    if (targets.empty() || (!compute && !raytracing)) {
+    if (targets.empty() || (!compute && !raytracing && !cuda_only)) {
         printf("usage: %s --targets <list> [--compute <file>] [--raytracing <file>]\n"
+               "          [--cudaonly <file> --cudaonly-fast <file>]\n"
                "       %s --dump <file>\n", argv[0], argv[0]);
         return 2;
     }
@@ -833,6 +917,13 @@ int main(int argc, char **argv) {
         CheckCompute(compute, targets);
     if (raytracing)
         CheckRayTracing(raytracing, targets);
+    if (cuda_only) {
+        if (!cuda_only_fast) {
+            printf("--cudaonly needs --cudaonly-fast\n");
+            return 2;
+        }
+        CheckCudaOnly(cuda_only, cuda_only_fast);
+    }
 
     printf("%d/%d checks passed\n", g_total_checks - g_failed_checks, g_total_checks);
     return g_failed_checks ? 1 : 0;
